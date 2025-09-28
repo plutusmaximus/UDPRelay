@@ -50,8 +50,8 @@ Requires **Python 3.8+**.
 Clone the repository:
 
 ```bash
-git clone https://github.com/your-username/udp-group-chat.git
-cd udp-group-chat
+git clone [https://github.com/your-username/udp-group-chat.git](https://github.com/plutusmaximus/UDPRelay.git)
+cd UDPRelay
 ```
 
 No external dependencies — only Python standard library modules are used.
@@ -152,8 +152,3 @@ Messages that don’t start with `!` are sent as chat payloads.
 - Code is formatted for readability, with concise comments and docstrings.
 
 ---
-
-## License
-
-MIT License © 2025 Your Name
-```
