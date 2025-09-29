@@ -10,27 +10,35 @@ DEFAULT_HEARTBEAT_SEC = 60.0
 
 
 class UDPCLIClient:
+    """Interactive CLI client for UDPRelay."""
+
     def __init__(self, server_host="127.0.0.1", server_port=5000, recv_buf=MAX_PAYLOAD):
+        # configure UDP socket
         self.server = (server_host, server_port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
         self.sock.setblocking(False)
         self.recv_buf = recv_buf
 
+        # state
         self.joined_group: Optional[str] = None
         self.last_created_group_id: Optional[str] = None
         self.heartbeat_interval = DEFAULT_HEARTBEAT_SEC
         self._stop = threading.Event()
 
-        # heartbeat smoothing: shared timestamp of last ping
+        # heartbeat smoothing timestamp
         self._last_ping_ts = 0.0
 
+        # background threads
         self._rx_t = threading.Thread(target=self._recv_loop, daemon=True)
         self._hb_t = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._rx_t.start()
         self._hb_t.start()
 
+    # ---- protocol send helpers (always ALL CAPS commands) ----
+
     def send_text(self, text: str):
+        """Send raw text to server."""
         self.sock.sendto(text.encode(), self.server)
 
     def create_group(self):
@@ -48,7 +56,10 @@ class UDPCLIClient:
     def who(self):
         self.send_text("!WHO")
 
+    # ---- background loops ----
+
     def _recv_loop(self):
+        """Listen for server responses and payloads."""
         while not self._stop.is_set():
             try:
                 r, _, _ = select.select([self.sock], [], [], 0.1)
@@ -60,6 +71,7 @@ class UDPCLIClient:
 
             msg = data.decode(errors="ignore")
 
+            # handle server messages
             if msg.startswith("OK CREATED"):
                 parts = msg.split(maxsplit=2)
                 if len(parts) >= 3:
@@ -80,7 +92,6 @@ class UDPCLIClient:
                 continue
 
             if msg.startswith("OK WHO"):
-                # Format: OK WHO <gid> <count>
                 parts = msg.split()
                 if len(parts) >= 4:
                     gid, count = parts[2], parts[3]
@@ -96,9 +107,7 @@ class UDPCLIClient:
                         secs = float(parts[1])
                         if secs > 0:
                             self.heartbeat_interval = secs
-                            # Smoothly apply new heartbeat: restart the timer
-                            # so the next ping happens after the full interval,
-                            # avoiding an immediate extra ping.
+                            # reset timer to avoid immediate ping
                             self._last_ping_ts = time.monotonic()
                     except ValueError:
                         pass
@@ -109,9 +118,11 @@ class UDPCLIClient:
                 print(f"[server] {msg}")
                 continue
 
+            # otherwise, treat as payload
             print(f"[payload] {msg}")
 
     def _heartbeat_loop(self):
+        """Send periodic pings while joined to a group."""
         while not self._stop.is_set():
             now = time.monotonic()
             interval = max(1.0, self.heartbeat_interval)
@@ -124,6 +135,7 @@ class UDPCLIClient:
             time.sleep(0.25)
 
     def close(self):
+        """Stop threads and close socket."""
         self._stop.set()
         try:
             self.sock.close()
@@ -136,6 +148,7 @@ class UDPCLIClient:
 
 
 def run_udp_client_cli(server_host="127.0.0.1", server_port=5000):
+    """Run interactive CLI for UDPRelay."""
     print(f"Connecting to server at {server_host}:{server_port} ...")
     client = UDPCLIClient(server_host, server_port)
     try:
@@ -174,11 +187,12 @@ def run_udp_client_cli(server_host="127.0.0.1", server_port=5000):
                 )
                 continue
 
+            # guard against raw '!' commands
             if line.startswith("!"):
                 print("[cli] error: direct '!' commands are not allowed. Use helpers like 'create', 'join', 'leave', 'ping', or 'who'.")
                 continue
 
-            # Local helper commands
+            # parse local helper command
             try:
                 parts = shlex.split(line)
             except ValueError as e:
@@ -230,6 +244,7 @@ def run_udp_client_cli(server_host="127.0.0.1", server_port=5000):
                 print("[cli] not joined; use !JOIN <group_id> or 'create --join'")
                 continue
 
+            # default: treat input as payload
             client.send_text(line)
     finally:
         client.close()

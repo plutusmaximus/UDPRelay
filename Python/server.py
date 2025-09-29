@@ -5,26 +5,24 @@ import string
 import time
 from typing import Dict, Set, Tuple, Optional
 
+# ---- Command tokens (CASE-SENSITIVE, ALL CAPS) ----
 CREATE_CMD = b"CREATE"
 JOIN_CMD = b"JOIN"
 LEAVE_CMD = b"LEAVE"
 PING_CMD = b"PING"
 WHO_CMD = b"WHO"
 
-ASCII_UP = bytes.maketrans(b"abcdefghijklmnopqrstuvwxyz", b"ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-
-def token_upper(b: bytes) -> bytes:
-    return b.translate(ASCII_UP)
-
-
+# Max command length for guards
 MAX_CMD_LEN = max(len(CREATE_CMD), len(JOIN_CMD), len(LEAVE_CMD), len(PING_CMD), len(WHO_CMD))
 MAX_CMD_WITH_PREFIX = 1 + MAX_CMD_LEN
 MAX_PAYLOAD = 4096  # hard cap for processed messages
 
 
 def split_cmd_arg(packet: bytes):
-    """Extract command (uppercased) and remainder argument."""
+    """
+    Extract command token (CASE-SENSITIVE, ALL CAPS) and remainder argument.
+    Returns (cmd_token_bytes, arg_bytes). If not a command, returns (b"", b"").
+    """
     if not packet or packet[:1] != b'!':
         return b"", b""
 
@@ -32,49 +30,29 @@ def split_cmd_arg(packet: bytes):
     sp = head.find(b" ")
     if sp == -1:
         tok = packet[1:]
-        return token_upper(tok), b""
+        return tok, b""
 
     tok = packet[1:sp]
-    return token_upper(tok), packet[sp + 1:]
+    return tok, packet[sp + 1:]
 
 
 def random_group_id(length: int = 8) -> str:
-    """Generate unique group IDs (letters/digits, excluding O/0)."""
+    """Generate group IDs (A–Z, 1–9), excluding 'O' and '0'."""
     alphabet = string.ascii_uppercase.replace("O", "") + string.digits.replace("0", "")
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 class UDPGroupServer:
     """
-    UDP-based group chat server.
-
-    Manages creation and cleanup of chat groups, tracks client membership
-    and activity, forwards payloads between peers, and enforces group/client
-    limits. Uses a heartbeat mechanism with sweeps to expire inactive clients
-    and long-empty groups.
+    UDPRelay server.
 
     Protocol:
-      - Commands start with '!' and are case-insensitive:
-          !CREATE             → create a new group, returns "OK CREATED <id>"
-          !JOIN <id>          → join an existing group, returns "OK JOINED <id>" or error
-          !LEAVE <id>         → leave a specific group, returns "OK LEFT <id>" or error
-          !PING               → heartbeat, returns "PONG <seconds>"
-          !WHO                → returns "OK WHO <group_id> <count>"
-
-      - Group IDs:
-          • 8 random chars (A–Z, 1–9), excluding 'O' and '0'
-          • Case-insensitive when joining
-          • Expire if empty for too long
-          • Each client may only own a limited number of active groups
-
-      - Payloads:
-          • Any packet not starting with '!' is treated as a message
-          • Broadcast to all peers in the same group
-          • Payloads also refresh the sender's activity (count as heartbeat)
-
-      - Inactivity:
-          • Clients are removed after 3 × heartbeat interval with no activity
-          • Empty groups removed after configured TTL
+      - Commands: CASE-SENSITIVE ALL CAPS, start with '!' (e.g., !JOIN ABCD1234)
+          !CREATE             → "OK CREATED <id>"
+          !JOIN <id>          → "OK JOINED <id>" or error
+          !LEAVE <id>         → "OK LEFT <id>" or error
+          !PING               → "PONG <seconds>"
+          !WHO                → "OK WHO <id> <count>"
     """
 
     def __init__(
@@ -89,49 +67,47 @@ class UDPGroupServer:
         per_group_caps: Optional[Dict[str, int]] = None,
         max_groups_per_client: int = 3,
     ):
-        # config
-        self.host = host                                    # bind address
-        self.port = port                                    # UDP port
-        self.bufsize = bufsize                              # max recv size
-        self.empty_group_ttl_sec = empty_group_ttl_sec      # how long empty groups survive
-        self.sweep_interval_sec = sweep_interval_sec        # interval between cleanup sweeps
+        # --- configuration ---
+        self.host = host                         # bind address
+        self.port = port                         # UDP port to listen on
+        self.bufsize = bufsize                   # max receive buffer size
+        self.empty_group_ttl_sec = empty_group_ttl_sec  # how long empty groups survive
+        self.sweep_interval_sec = sweep_interval_sec    # interval between cleanup sweeps
         self.suggested_heartbeat_sec = suggested_heartbeat_sec  # PONG heartbeat hint
-        self.max_group_size = max_group_size                # global max peers per group
-        self.per_group_caps = per_group_caps or {}          # optional per-group caps
+        self.max_group_size = max_group_size     # global max peers per group
+        self.per_group_caps = per_group_caps or {}  # optional per-group caps
         self.max_groups_per_client = max_groups_per_client  # cap on groups per creator
 
-        # socket
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.host, self.port))
-        self.sock.setblocking(False)
+        # --- UDP socket setup ---
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP socket
+        self.sock.bind((self.host, self.port))                        # bind to address/port
+        self.sock.setblocking(False)                                  # non-blocking mode
 
-        # state tracking
-        self.groups: Dict[str, Set[Tuple[str, int]]] = {}               # gid -> set of peers
-        self.group_creator: Dict[str, Tuple[str, int]] = {}             # gid -> creator addr
-        self.empty_since: Dict[str, float] = {}                         # gid -> empty-since timestamp
-        self.creator_active_groups: Dict[Tuple[str, int], Set[str]] = {}  # creator addr -> active gids
-        self.client_group: Dict[Tuple[str, int], str] = {}              # client addr -> joined gid
-        self.last_seen: Dict[Tuple[str, int], float] = {}               # client addr -> last activity time
+        # --- state tracking ---
+        self.groups: Dict[str, Set[Tuple[str, int]]] = {}  # gid → set of peer addresses
+        self.group_creator: Dict[str, Tuple[str, int]] = {}  # gid → creator’s address
+        self.empty_since: Dict[str, float] = {}  # gid → timestamp when last emptied
+        self.creator_active_groups: Dict[Tuple[str, int], Set[str]] = {}  # creator → set of active gids
+        self.client_group: Dict[Tuple[str, int], str] = {}  # client address → joined gid
+        self.last_seen: Dict[Tuple[str, int], float] = {}  # client address → last activity timestamp
 
-        # time tracking
-        self.now = time.monotonic()                       # current monotonic timestamp
-        self.next_sweep = self.now + self.sweep_interval_sec  # next cleanup time
+        # --- timers ---
+        self.now = time.monotonic()             # current monotonic time
+        self.next_sweep = self.now + self.sweep_interval_sec  # when next cleanup sweep should run
 
         print(
-            f"UDP group server listening on {self.host}:{self.port} "
+            f"UDPRelay server listening on {self.host}:{self.port} "
             f"(max payload {self.bufsize} bytes)..."
         )
 
     # ---------- Helpers ----------
 
     def cap_for(self, gid: str) -> Optional[int]:
-        """Look up per-group cap, fall back to global cap."""
-        if gid in self.per_group_caps:
-            return self.per_group_caps[gid]
-        return self.max_group_size
+        """Return per-group cap if defined, else global cap."""
+        return self.per_group_caps.get(gid, self.max_group_size)
 
     def mark_group_empty_if_needed(self, gid: str, now: float):
-        """Track when groups become empty (for TTL cleanup)."""
+        """Mark group as empty if no peers left (for TTL cleanup)."""
         peers = self.groups.get(gid)
         if peers is not None and len(peers) == 0:
             self.empty_since[gid] = now
@@ -139,7 +115,7 @@ class UDPGroupServer:
             self.empty_since.pop(gid, None)
 
     def remove_group(self, gid: str):
-        """Delete group and update creator tracking."""
+        """Remove group and update creator tracking."""
         self.groups.pop(gid, None)
         self.empty_since.pop(gid, None)
         creator = self.group_creator.pop(gid, None)
@@ -153,7 +129,7 @@ class UDPGroupServer:
     # ---------- Packet handling ----------
 
     def handle_payload(self, packet: bytes, addr: Tuple[str, int]):
-        """Forward message payloads to all peers in the group."""
+        """Forward payload to all peers in the sender's group."""
         if len(packet) > MAX_PAYLOAD:
             self.sock.sendto(b"ERR Payload too large", addr)
             return
@@ -164,6 +140,7 @@ class UDPGroupServer:
             self.sock.sendto(b"ERR Join an existing group first. Use: !JOIN <group_id>", addr)
             return
 
+        # update activity
         self.last_seen[addr] = self.now
         peers = self.groups[gid]
         to_prune = []
@@ -184,7 +161,7 @@ class UDPGroupServer:
         self.mark_group_empty_if_needed(gid, self.now)
 
     def handle_create(self, addr: Tuple[str, int]):
-        """Create a new group, enforcing per-client group cap."""
+        """Create a new group, respecting per-creator group caps."""
         active_set = self.creator_active_groups.get(addr)
         used = len(active_set) if active_set else 0
         if used >= self.max_groups_per_client:
@@ -193,6 +170,7 @@ class UDPGroupServer:
             )
             return
 
+        # ensure unique group ID
         gid = random_group_id()
         while gid in self.groups:
             gid = random_group_id()
@@ -204,7 +182,7 @@ class UDPGroupServer:
         self.sock.sendto(("OK CREATED " + gid).encode(), addr)
 
     def handle_join(self, arg_bytes: bytes, addr: Tuple[str, int]):
-        """Join an existing group, case-insensitive."""
+        """Join an existing group (group IDs compared case-insensitively)."""
         gid = arg_bytes.decode('utf-8', 'ignore').strip().upper()
         if not gid:
             self.sock.sendto(b"ERR Usage: !JOIN <group_id>", addr)
@@ -215,19 +193,23 @@ class UDPGroupServer:
 
         current = self.client_group.get(addr)
         if current == gid:
+            # already in group
             self.last_seen[addr] = self.now
             self.sock.sendto(("OK JOINED " + gid).encode(), addr)
             return
 
+        # enforce caps
         cap = self.cap_for(gid)
         if cap is not None and len(self.groups[gid]) >= cap:
             self.sock.sendto(("ERR Group full " + gid).encode(), addr)
             return
 
+        # leave old group if needed
         if current and current in self.groups:
             self.groups[current].discard(addr)
             self.mark_group_empty_if_needed(current, self.now)
 
+        # join new group
         self.client_group[addr] = gid
         self.groups[gid].add(addr)
         self.last_seen[addr] = self.now
@@ -235,7 +217,7 @@ class UDPGroupServer:
         self.sock.sendto(("OK JOINED " + gid).encode(), addr)
 
     def handle_leave(self, arg_bytes: bytes, addr: Tuple[str, int]):
-        """Leave a specific group by ID (requires !LEAVE <id>)."""
+        """Leave a specific group (requires !LEAVE <id>)."""
         gid = arg_bytes.decode('utf-8', 'ignore').strip().upper()
         if not gid:
             self.sock.sendto(b"ERR Usage: !LEAVE <group_id>", addr)
@@ -246,6 +228,7 @@ class UDPGroupServer:
             self.sock.sendto(b"ERR Not in that group", addr)
             return
 
+        # drop client
         self.client_group.pop(addr, None)
 
         if gid in self.groups:
@@ -256,7 +239,7 @@ class UDPGroupServer:
         self.sock.sendto(("OK LEFT " + gid).encode(), addr)
 
     def handle_ping(self, addr: Tuple[str, int]):
-        """Heartbeat ping: refresh last_seen and reply with PONG."""
+        """Refresh last_seen and reply with heartbeat hint."""
         gid = self.client_group.get(addr)
         if not gid or gid not in self.groups:
             self.client_group.pop(addr, None)
@@ -269,7 +252,7 @@ class UDPGroupServer:
         )
 
     def handle_who(self, addr: Tuple[str, int]):
-        """Return group id and peer count for the caller's current group."""
+        """Return group ID and peer count for the caller's group."""
         gid = self.client_group.get(addr)
         if not gid or gid not in self.groups:
             self.sock.sendto(b"ERR Join an existing group first. Use: !JOIN <group_id>", addr)
@@ -278,46 +261,41 @@ class UDPGroupServer:
         self.sock.sendto(f"OK WHO {gid} {count}".encode(), addr)
 
     def handle_command(self, packet: bytes, addr: Tuple[str, int]):
-        """Dispatch commands by token (with over-long token guard)."""
-        cmd_up, arg_bytes = split_cmd_arg(packet)
-        if not cmd_up:
+        """Dispatch commands by token, with over-long guard."""
+        cmd, arg_bytes = split_cmd_arg(packet)
+        if not cmd:
             self.sock.sendto(b"ERR Unknown command", addr)
             return
 
-        # Guard over-long or malformed command tokens (e.g., !THISISWAYTOOLONG)
-        if len(cmd_up) > MAX_CMD_LEN:
+        if len(cmd) > MAX_CMD_LEN:
             self.sock.sendto(b"ERR Unknown command", addr)
             return
 
-        if cmd_up == token_upper(CREATE_CMD):
+        if cmd == CREATE_CMD:
             self.handle_create(addr)
             return
-
-        if cmd_up == token_upper(JOIN_CMD):
+        if cmd == JOIN_CMD:
             self.handle_join(arg_bytes, addr)
             return
-
-        if cmd_up == token_upper(LEAVE_CMD):
+        if cmd == LEAVE_CMD:
             self.handle_leave(arg_bytes, addr)
             return
-
-        if cmd_up == token_upper(PING_CMD):
+        if cmd == PING_CMD:
             self.handle_ping(addr)
             return
-
-        if cmd_up == token_upper(WHO_CMD):
+        if cmd == WHO_CMD:
             self.handle_who(addr)
             return
 
         self.sock.sendto(b"ERR Unknown command", addr)
 
     def sweep(self):
-        """Periodically clean up inactive clients and long-empty groups."""
+        """Cleanup inactive clients and long-empty groups."""
         inactivity_limit_sec = 3 * self.suggested_heartbeat_sec
         cutoff_clients = self.now - inactivity_limit_sec
         cutoff_groups = self.now - self.empty_group_ttl_sec
 
-        # Inactive clients
+        # prune inactive clients
         for a, seen_at in list(self.last_seen.items()):
             if seen_at < cutoff_clients:
                 gid = self.client_group.pop(a, None)
@@ -326,7 +304,7 @@ class UDPGroupServer:
                     self.groups[gid].discard(a)
                     self.mark_group_empty_if_needed(gid, self.now)
 
-        # Long-empty groups
+        # prune long-empty groups
         for gid, since in list(self.empty_since.items()):
             if since < cutoff_groups and gid in self.groups and len(self.groups[gid]) == 0:
                 self.remove_group(gid)
@@ -334,6 +312,7 @@ class UDPGroupServer:
     # ---------- Main loop ----------
 
     def run(self):
+        """Main server loop: wait for packets, process, sweep."""
         while True:
             self.now = time.monotonic()
             timeout = max(0.0, self.next_sweep - self.now)
@@ -359,6 +338,7 @@ class UDPGroupServer:
                 self.handle_command(packet, addr)
                 continue
 
+            # time for sweep
             if self.now >= self.next_sweep:
                 self.sweep()
                 self.next_sweep = self.now + self.sweep_interval_sec
@@ -375,7 +355,7 @@ def udp_group_broadcast_server(
     per_group_caps: Optional[Dict[str, int]] = None,
     max_groups_per_client: int = 3,
 ):
-    """Convenience wrapper to match old API."""
+    """Convenience wrapper for running a UDPRelay server."""
     server = UDPGroupServer(
         host=host,
         port=port,

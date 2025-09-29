@@ -1,4 +1,5 @@
 # UDPRelay
+
 A lightweight **UDP-based group chat system** written in Python, with a command-line interface (CLI) client and a simple broadcast server.  
 Supports dynamic group creation, joining, leaving, and automatic cleanup of inactive clients and empty groups.
 
@@ -22,12 +23,46 @@ Supports dynamic group creation, joining, leaving, and automatic cleanup of inac
   - Automatic heartbeat pings at the server’s suggested interval.
   - Guard against sending raw `!` commands — encourages use of helpers.
 
-- **Commands (case-insensitive, start with `!`)**
-  - `!CREATE` → create a new group (`OK CREATED <id>`).
-  - `!JOIN <id>` → join an existing group (`OK JOINED <id>`).
-  - `!LEAVE <id>` → leave a specific group (`OK LEFT <id>`).
-  - `!PING` → refresh activity, server replies with `PONG <seconds>`.
-  - `!WHO` → query your current group’s member count (`OK WHO <id> <count>`).
+---
+
+## Protocol
+
+The chat system uses plain **UTF-8 text over UDP datagrams**.  
+Packets fall into two categories:
+
+1. **Commands**  
+   - Always start with `!` (exclamation mark).  
+   - **Commands are case-sensitive and must be written in ALL CAPS.**  
+   - Arguments (like group IDs) follow the command, separated by spaces.  
+   - Unknown or malformed commands result in an error response.
+
+2. **Payload messages**  
+   - Any packet not starting with `!` is treated as chat payload.  
+   - Payloads are broadcast to all peers in the same group as the sender.  
+   - Maximum payload size: **4096 bytes**.
+
+### Commands
+
+- `!CREATE` → Create a new group.  
+- `!JOIN <group_id>` → Join an existing group (IDs case-insensitive).  
+- `!LEAVE <group_id>` → Leave a group.  
+- `!PING` → Heartbeat message (server replies with `PONG <seconds>`).  
+- `!WHO` → Query the member count of the group you are currently in.  
+
+### Errors
+
+Errors are plain text messages starting with `ERR`.  
+Examples:  
+- `ERR Unknown command`  
+- `ERR Payload too large`  
+- `ERR Usage: !JOIN <group_id>`  
+- `ERR Group full <group_id>`  
+
+### Inactivity and Cleanup
+
+- Clients are removed after **3 × heartbeat interval** with no activity.  
+- Empty groups are deleted after the configured TTL.  
+- Group IDs expire when their group is deleted.  
 
 ---
 
@@ -50,7 +85,7 @@ Requires **Python 3.8+**.
 Clone the repository:
 
 ```bash
-git clone [https://github.com/your-username/udp-group-chat.git](https://github.com/plutusmaximus/UDPRelay.git)
+git clone https://github.com/plutusmaximus/UDPRelay.git
 cd UDPRelay
 ```
 
@@ -146,9 +181,9 @@ Messages that don’t start with `!` are sent as chat payloads.
 
 ## Development Notes
 
-- Payload size is clamped to **4 KiB** on both server and client.
-- Over-long or unknown commands return `ERR Unknown command`.
-- CLI forbids raw `!` input — always use helper commands.
-- Code is formatted for readability, with concise comments and docstrings.
+- Payload size is clamped to **4 KiB** on both server and client.  
+- Commands are **ALL CAPS and case-sensitive**.  
+- Over-long or unknown commands return `ERR Unknown command`.  
+- CLI forbids raw `!` input — always use helper commands.  
+- Code is formatted for readability, with concise comments and docstrings.  
 
----

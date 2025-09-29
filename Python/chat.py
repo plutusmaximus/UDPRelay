@@ -4,7 +4,8 @@ from client import run_udp_client_cli
 
 
 def main():
-    parser = argparse.ArgumentParser(description="UDP Group Chat - Server/Client")
+    """Entry point for UDPRelay: run as server or client."""
+    parser = argparse.ArgumentParser(description="UDPRelay - Server/Client")
     parser.add_argument("--server", action="store_true", help="Run as server (otherwise client)")
     parser.add_argument("--host", default="127.0.0.1", help="Server host")
     parser.add_argument("--port", type=int, default=5000, help="UDP port")
