@@ -3,6 +3,8 @@ import select
 import threading
 import time
 import shlex
+import re
+import random
 from typing import Optional
 
 MAX_PAYLOAD = 4096
@@ -39,6 +41,8 @@ class UDPCLIClient:
 
     def send_text(self, text: str):
         """Send raw text to server."""
+        # Reset heartbeat timer on any user send (smoothing)
+        self._last_ping_ts = time.monotonic()
         self.sock.sendto(text.encode(), self.server)
 
     def create_group(self):
@@ -107,15 +111,20 @@ class UDPCLIClient:
                         secs = float(parts[1])
                         if secs > 0:
                             self.heartbeat_interval = secs
-                            # reset timer to avoid immediate ping
-                            self._last_ping_ts = time.monotonic()
+                            # reset timer with small jitter to avoid herding
+                            self._last_ping_ts = time.monotonic() - random.uniform(0.0, 0.1 * secs)
                     except ValueError:
                         pass
                 print(f"[server] {msg}")
                 continue
 
             if msg.startswith("ERR"):
-                print(f"[server] {msg}")
+                m = re.match(r"^ERR\s+([A-Z_]+)\s+(.*)$", msg.strip())
+                if m:
+                    code, detail = m.group(1), m.group(2)
+                    print(f"[server] error: {code} - {detail}")
+                else:
+                    print(f"[server] {msg}")
                 continue
 
             # otherwise, treat as payload
@@ -138,7 +147,7 @@ class UDPCLIClient:
         """Stop threads and close socket."""
         self._stop.set()
         try:
-            self.sock.close()
+            self.sock.close()  # unblock select
         except OSError:
             pass
         if self._rx_t.is_alive():
@@ -176,14 +185,20 @@ def run_udp_client_cli(server_host="127.0.0.1", server_port=5000):
                     "  ping\n"
                     "  status\n"
                     "  quit/exit\n"
+                    "  (messages that don't start with '!' are broadcast to your current group)\n"
                 )
                 continue
 
             if line.lower() == "status":
+                def _eta():
+                    interval = max(1.0, client.heartbeat_interval)
+                    return max(0.0, interval - (time.monotonic() - client._last_ping_ts))
                 print(
-                    f"[cli] group={client.joined_group or '<none>'} "
+                    f"[cli] server={client.server[0]}:{client.server[1]} "
+                    f"group={client.joined_group or '<none>'} "
                     f"last_created={client.last_created_group_id or '<none>'} "
-                    f"heartbeat_interval={client.heartbeat_interval:.3f}s"
+                    f"heartbeat_interval={client.heartbeat_interval:.3f}s "
+                    f"next_ping_eta={_eta():.2f}s"
                 )
                 continue
 
@@ -241,7 +256,7 @@ def run_udp_client_cli(server_host="127.0.0.1", server_port=5000):
                 continue
 
             if not client.joined_group:
-                print("[cli] not joined; use !JOIN <group_id> or 'create --join'")
+                print("[cli] not joined; use 'join <group_id>' or 'create --join'")
                 continue
 
             # default: treat input as payload

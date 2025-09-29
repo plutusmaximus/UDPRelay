@@ -3,6 +3,7 @@ import select
 import secrets
 import string
 import time
+import sys
 from typing import Dict, Set, Tuple, Optional
 
 # ---- Command tokens (CASE-SENSITIVE, ALL CAPS) ----
@@ -16,6 +17,22 @@ WHO_CMD = b"WHO"
 MAX_CMD_LEN = max(len(CREATE_CMD), len(JOIN_CMD), len(LEAVE_CMD), len(PING_CMD), len(WHO_CMD))
 MAX_CMD_WITH_PREFIX = 1 + MAX_CMD_LEN
 MAX_PAYLOAD = 4096  # hard cap for processed messages
+
+# ---- Reply helpers / codes ----
+def OK(detail: str = "OK") -> bytes:
+    return f"OK {detail}".encode()
+
+def ERR(code: str, msg: str) -> bytes:
+    return f"ERR {code} {msg}".encode()
+
+ERR_BAD_CMD = "BAD_CMD"
+ERR_BAD_ARG = "BAD_ARG"
+ERR_NOT_IN_GROUP = "NOT_IN_GROUP"
+ERR_ALREADY_IN_GROUP = "ALREADY_IN_GROUP"
+ERR_GROUP_FULL = "GROUP_FULL"
+ERR_CLIENT_LIMIT = "CLIENT_LIMIT"
+ERR_TOO_LARGE = "TOO_LARGE"
+ERR_INTERNAL = "INTERNAL"
 
 
 def split_cmd_arg(packet: bytes):
@@ -99,6 +116,15 @@ class UDPGroupServer:
             f"UDPRelay server listening on {self.host}:{self.port} "
             f"(max payload {self.bufsize} bytes)..."
         )
+        # simple observability counters
+        self.stats = {
+            "packets_rx": 0,
+            "packets_tx": 0,
+            "drops_oversize": 0,
+            "joins": 0,
+            "leaves": 0,
+            "creates": 0,
+        }
 
     # ---------- Helpers ----------
 
@@ -131,13 +157,14 @@ class UDPGroupServer:
     def handle_payload(self, packet: bytes, addr: Tuple[str, int]):
         """Forward payload to all peers in the sender's group."""
         if len(packet) > MAX_PAYLOAD:
-            self.sock.sendto(b"ERR Payload too large", addr)
+            self.sock.sendto(ERR(ERR_TOO_LARGE, "PayloadTooLarge"), addr)
+            self.stats["drops_oversize"] += 1
             return
 
         gid = self.client_group.get(addr)
         if not gid or gid not in self.groups:
             self.client_group.pop(addr, None)
-            self.sock.sendto(b"ERR Join an existing group first. Use: !JOIN <group_id>", addr)
+            self.sock.sendto(ERR(ERR_NOT_IN_GROUP, "JoinFirstUseJOIN"), addr)
             return
 
         # update activity
@@ -150,6 +177,7 @@ class UDPGroupServer:
                 continue
             try:
                 self.sock.sendto(packet, peer)
+                self.stats["packets_tx"] += 1
             except OSError:
                 to_prune.append(peer)
 
@@ -165,9 +193,7 @@ class UDPGroupServer:
         active_set = self.creator_active_groups.get(addr)
         used = len(active_set) if active_set else 0
         if used >= self.max_groups_per_client:
-            self.sock.sendto(
-                f"ERR Group limit {used}/{self.max_groups_per_client}".encode(), addr
-            )
+            self.sock.sendto(ERR(ERR_CLIENT_LIMIT, f"{used}/{self.max_groups_per_client}"), addr)
             return
 
         # ensure unique group ID
@@ -179,29 +205,31 @@ class UDPGroupServer:
         self.group_creator[gid] = addr
         self.empty_since[gid] = self.now
         self.creator_active_groups.setdefault(addr, set()).add(gid)
-        self.sock.sendto(("OK CREATED " + gid).encode(), addr)
+        self.sock.sendto(OK(f"CREATED {gid}"), addr)
+        self.stats["creates"] += 1
+        print(f"[INFO] create gid={gid} by={addr}", file=sys.stderr)
 
     def handle_join(self, arg_bytes: bytes, addr: Tuple[str, int]):
         """Join an existing group (group IDs compared case-insensitively)."""
         gid = arg_bytes.decode('utf-8', 'ignore').strip().upper()
         if not gid:
-            self.sock.sendto(b"ERR Usage: !JOIN <group_id>", addr)
+            self.sock.sendto(ERR(ERR_BAD_ARG, "Usage:!JOIN <GROUPID>"), addr)
             return
         if gid not in self.groups:
-            self.sock.sendto(b"ERR No such group", addr)
+            self.sock.sendto(ERR(ERR_BAD_ARG, "NoSuchGroup"), addr)
             return
 
         current = self.client_group.get(addr)
         if current == gid:
             # already in group
             self.last_seen[addr] = self.now
-            self.sock.sendto(("OK JOINED " + gid).encode(), addr)
+            self.sock.sendto(OK(f"JOINED {gid}"), addr)
             return
 
         # enforce caps
         cap = self.cap_for(gid)
         if cap is not None and len(self.groups[gid]) >= cap:
-            self.sock.sendto(("ERR Group full " + gid).encode(), addr)
+            self.sock.sendto(ERR(ERR_GROUP_FULL, gid), addr)
             return
 
         # leave old group if needed
@@ -214,18 +242,20 @@ class UDPGroupServer:
         self.groups[gid].add(addr)
         self.last_seen[addr] = self.now
         self.empty_since.pop(gid, None)
-        self.sock.sendto(("OK JOINED " + gid).encode(), addr)
+        self.sock.sendto(OK(f"JOINED {gid}"), addr)
+        self.stats["joins"] += 1
+        print(f"[INFO] join gid={gid} addr={addr} size={len(self.groups[gid])}", file=sys.stderr)
 
     def handle_leave(self, arg_bytes: bytes, addr: Tuple[str, int]):
         """Leave a specific group (requires !LEAVE <id>)."""
         gid = arg_bytes.decode('utf-8', 'ignore').strip().upper()
         if not gid:
-            self.sock.sendto(b"ERR Usage: !LEAVE <group_id>", addr)
+            self.sock.sendto(ERR(ERR_BAD_ARG, "Usage:!LEAVE <GROUPID>"), addr)
             return
 
         current = self.client_group.get(addr)
         if not current or current.upper() != gid:
-            self.sock.sendto(b"ERR Not in that group", addr)
+            self.sock.sendto(ERR(ERR_NOT_IN_GROUP, "NotInThatGroup"), addr)
             return
 
         # drop client
@@ -236,14 +266,16 @@ class UDPGroupServer:
             self.mark_group_empty_if_needed(gid, self.now)
 
         self.last_seen.pop(addr, None)
-        self.sock.sendto(("OK LEFT " + gid).encode(), addr)
+        self.sock.sendto(OK(f"LEFT {gid}"), addr)
+        self.stats["leaves"] += 1
+        print(f"[INFO] leave gid={gid} addr={addr} size={len(self.groups.get(gid,set()))}", file=sys.stderr)
 
     def handle_ping(self, addr: Tuple[str, int]):
         """Refresh last_seen and reply with heartbeat hint."""
         gid = self.client_group.get(addr)
         if not gid or gid not in self.groups:
             self.client_group.pop(addr, None)
-            self.sock.sendto(b"ERR Join an existing group first. Use: !JOIN <group_id>", addr)
+            self.sock.sendto(ERR(ERR_NOT_IN_GROUP, "JoinFirstUseJOIN"), addr)
             return
 
         self.last_seen[addr] = self.now
@@ -255,20 +287,20 @@ class UDPGroupServer:
         """Return group ID and peer count for the caller's group."""
         gid = self.client_group.get(addr)
         if not gid or gid not in self.groups:
-            self.sock.sendto(b"ERR Join an existing group first. Use: !JOIN <group_id>", addr)
+            self.sock.sendto(ERR(ERR_NOT_IN_GROUP, "JoinFirstUseJOIN"), addr)
             return
         count = len(self.groups.get(gid, ()))
-        self.sock.sendto(f"OK WHO {gid} {count}".encode(), addr)
+        self.sock.sendto(OK(f"WHO {gid} {count}"), addr)
 
     def handle_command(self, packet: bytes, addr: Tuple[str, int]):
         """Dispatch commands by token, with over-long guard."""
         cmd, arg_bytes = split_cmd_arg(packet)
         if not cmd:
-            self.sock.sendto(b"ERR Unknown command", addr)
+            self.sock.sendto(ERR(ERR_BAD_CMD, "UnknownCommand"), addr)
             return
 
         if len(cmd) > MAX_CMD_LEN:
-            self.sock.sendto(b"ERR Unknown command", addr)
+            self.sock.sendto(ERR(ERR_BAD_CMD, "UnknownCommand"), addr)
             return
 
         if cmd == CREATE_CMD:
@@ -287,7 +319,7 @@ class UDPGroupServer:
             self.handle_who(addr)
             return
 
-        self.sock.sendto(b"ERR Unknown command", addr)
+        self.sock.sendto(ERR(ERR_BAD_CMD, "UnknownCommand"), addr)
 
     def sweep(self):
         """Cleanup inactive clients and long-empty groups."""
@@ -321,7 +353,8 @@ class UDPGroupServer:
 
             if readable:
                 try:
-                    packet, addr = self.sock.recvfrom(self.bufsize)
+                    # read one byte past cap to detect oversize
+                    packet, addr = self.sock.recvfrom(self.bufsize + 1)
                 except BlockingIOError:
                     packet, addr = None, None
 
@@ -330,6 +363,14 @@ class UDPGroupServer:
 
                 if len(packet) == 0:
                     continue
+
+                # global oversize guard (binary-safe)
+                if len(packet) > MAX_PAYLOAD:
+                    self.sock.sendto(ERR(ERR_TOO_LARGE, "PayloadTooLarge"), addr)
+                    self.stats["drops_oversize"] += 1
+                    continue
+
+                self.stats["packets_rx"] += 1
 
                 if packet[0:1] != b'!':
                     self.handle_payload(packet, addr)

@@ -27,42 +27,48 @@ Supports dynamic group creation, joining, leaving, and automatic cleanup of inac
 
 ## Protocol
 
-The chat system uses plain **UTF-8 text over UDP datagrams**.  
+The chat system uses **UDP datagrams**.  
 Packets fall into two categories:
 
 1. **Commands**  
    - Always start with `!` (exclamation mark).  
    - **Commands are case-sensitive and must be written in ALL CAPS.**  
    - Arguments (like group IDs) follow the command, separated by spaces.  
-   - Unknown or malformed commands result in an error response.
+   - Unknown or malformed commands result in an error response.  
+   - Commands and responses are text-based (UTF-8).
 
 2. **Payload messages**  
-   - Any packet not starting with `!` is treated as chat payload.  
+   - Any packet not starting with `!` is treated as a chat payload.  
    - Payloads are broadcast to all peers in the same group as the sender.  
-   - Maximum payload size: **4096 bytes**.
+   - Maximum payload size: **4096 bytes** (packets above this size are rejected).  
+   - Payloads are binary-safe; the server relays them verbatim without decoding.
 
 ### Commands
 
-- `!CREATE` → Create a new group.  
-- `!JOIN <group_id>` → Join an existing group (IDs case-insensitive).  
-- `!LEAVE <group_id>` → Leave a group.  
-- `!PING` → Heartbeat message (server replies with `PONG <seconds>`).  
-- `!WHO` → Query the member count of the group you are currently in.  
+| Command            | Reply format          | Notes                                 |
+|--------------------|-----------------------|---------------------------------------|
+| `!CREATE`          | `OK CREATED <id>`     | Create a new group (random 8-char ID) |
+| `!JOIN <group_id>` | `OK JOINED <id>`      | Join an existing group                 |
+| `!LEAVE <group_id>`| `OK LEFT <id>`        | Leave the given group                  |
+| `!PING`            | `PONG <seconds>`      | Heartbeat; server suggests interval    |
+| `!WHO`             | `OK WHO <id> <count>` | Show member count in your current group |
 
 ### Errors
 
-Errors are plain text messages starting with `ERR`.  
+Errors use a structured envelope: `ERR <CODE> <Message>`, where `<CODE>` is machine-friendly and `<Message>` is a short human-readable string.
+
 Examples:  
-- `ERR Unknown command`  
-- `ERR Payload too large`  
-- `ERR Usage: !JOIN <group_id>`  
-- `ERR Group full <group_id>`  
+- `ERR BAD_CMD UnknownCommand`  
+- `ERR BAD_ARG Usage:!JOIN <GROUPID>`  
+- `ERR NOT_IN_GROUP JoinFirstUseJOIN`  
+- `ERR GROUP_FULL ABCD1234`  
+- `ERR TOO_LARGE PayloadTooLarge`  
 
 ### Inactivity and Cleanup
 
-- Clients are removed after **3 × heartbeat interval** with no activity.  
+- Clients are removed after **3 × heartbeat interval** with no **activity** (either payloads or pings).  
 - Empty groups are deleted after the configured TTL.  
-- Group IDs expire when their group is deleted.  
+- Group IDs expire when their group is deleted; IDs may be reused by future groups.  
 
 ---
 
@@ -183,7 +189,6 @@ Messages that don’t start with `!` are sent as chat payloads.
 
 - Payload size is clamped to **4 KiB** on both server and client.  
 - Commands are **ALL CAPS and case-sensitive**.  
-- Over-long or unknown commands return `ERR Unknown command`.  
+- Over-long or unknown commands return `ERR BAD_CMD UnknownCommand`.  
 - CLI forbids raw `!` input — always use helper commands.  
-- Code is formatted for readability, with concise comments and docstrings.  
-
+- Code is formatted for readability, with concise comments and docstrings.
